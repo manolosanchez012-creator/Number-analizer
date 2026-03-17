@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Number Analyzer with Selectable Area</title>
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; background:#111; color:#eee; margin:0; padding:20px; }
+    h1 { font-size:20px; margin-bottom:10px; }
+    #topBar { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+    #container { display:flex; gap:20px; flex-wrap:wrap; }
+    #videoWrapper { position:relative; display:inline-block; }
+    #videoContainer, #statsContainer { background:#222; padding:15px; border-radius:8px; }
+    video { max-width:400px; border-radius:8px; background:#000; }
+    #overlay {
+      position:absolute;
+      border:3px solid red;
+      box-sizing:border-box;
+      touch-action:none;
+    }
+    #overlayHandle {
+      position:absolute;
+      width:22px;
+      height:22px;
+      background:red;
+      right:-11px;
+      bottom:-11px;
+      border-radius:50%;
+      touch-action:none;
+    }
+    canvas { display:none; }
+    .label { font-size:12px; color:#aaa; text-transform:uppercase; margin-top:10px; }
+    .value { font-size:28px; margin-top:5px; }
+    .small { font-size:12px; color:#ccc; margin-top:5px; max-width:260px; }
+    .mode-list { font-size:18px; margin-top:5px; }
+    .pill { display:inline-block; background:#444; padding:2px 8px; border-radius:999px; margin-right:4px; }
+    #status { font-size:12px; color:#aaa; margin-top:8px; white-space:pre-line; }
+    button { background:#0d6efd; color:#fff; border:none; padding:8px 12px; border-radius:6px; cursor:pointer; font-size:13px; }
+    button:disabled { opacity:0.5; cursor:default; }
+  </style>
+</head>
+<body>
+  <h1>Number Analyzer (Selectable Area, Decimals)</h1>
+
+  <div id="topBar">
+    <div id="modeSelector">
+      <label>
+        <input type="radio" name="mode" value="median" checked />
+        Median (middle number)
+      </label>
+      &nbsp;&nbsp;
+      <label>
+        <input type="radio" name="mode" value="mode" />
+        Most repeated number
+      </label>
+    </div>
+    <button id="saveButton" disabled>Save current information</button>
+  </div>
+
+  <div id="container">
+    <div id="videoContainer">
+      <div id="videoWrapper">
+        <video id="video" autoplay playsinline></video>
+        <div id="overlay">
+          <div id="overlayHandle"></div>
+        </div>
+      </div>
+      <div id="status">Initializing camera…</div>
+    </div>
+
+    <div id="statsContainer">
+      <div class="label">Current mode</div>
+      <div class="value" id="currentMode">Median</div>
+
+      <div class="label">Result (continuous)</div>
+      <div class="value" id="mainResult">–</div>
+
+      <div class="label">All detected numbers</div>
+      <div class="small" id="numbersList">None yet</div>
+
+      <div class="label">Modes (when in “Most repeated”)</div>
+      <div class="mode-list" id="modeList">–</div>
+
+      <div class="label">Last update</div>
+      <div class="small" id="lastUpdate">Waiting for first capture…</div>
+    </div>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const statusEl = document.getElementById('status');
+    const mainResultEl = document.getElementById('mainResult');
+    const numbersListEl = document.getElementById('numbersList');
+    const lastUpdateEl = document.getElementById('lastUpdate');
+    const modeListEl = document.getElementById('modeList');
+    const currentModeEl = document.getElementById('currentMode');
+    const saveButton = document.getElementById('saveButton');
+
+    const videoWrapper = document.getElementById('videoWrapper');
+    const overlay = document.getElementById('overlay');
+    const overlayHandle = document.getElementById('overlayHandle');
+
+    let allNumbers = [];
+    let processing = false;
+    let mode = 'median';
+    let ocrWorker = null;
+    let lastDetectedInFrame = [];
+
+    function resetOverlay() {
+      const rect = video.getBoundingClientRect();
+      const w = rect.width;
+      const h = rect.height;
+      overlay.style.left = (w * 0.25) + 'px';
+      overlay.style.top = (h * 0.25) + 'px';
+      overlay.style.width = (w * 0.5) + 'px';
+      overlay.style.height = (h * 0.5) + 'px';
+    }
+
+    document.querySelectorAll('input[name="mode"]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        mode = radio.value;
+        currentModeEl.textContent = mode === 'median' ? 'Median' : 'Most repeated';
+        updateStatsDisplay();
+      });
+    });
+
+    function calculateMedian(arr) {
+      if (!arr.length) return null;
+      const sorted = [...arr].sort((a, b) => a - b);
+      const len = sorted.length;
+      if (len % 2 === 1) return sorted[(len - 1) / 2];
+      return (sorted[len / 2 - 1] + sorted[len / 2]) / 2;
+    }
+
+    function calculateModes(arr) {
+      if (!arr.length) return [];
+      const freq = {};
+      arr.forEach(n => { freq[n] = (freq[n] || 0) + 1; });
+      let maxF = 0;
+      Object.values(freq).forEach(v => { if (v > maxF) maxF = v; });
+      const modes = Object.entries(freq)
+        .filter(([_, v]) => v === maxF)
+        .map(([k]) => Number(k));
+      if (modes.length === Object.keys(freq).length) return [];
+      return modes;
+    }
+
+    function updateStatsDisplay() {
+      if (!allNumbers.length) {
+        mainResultEl.textContent = '–';
+        numbersListEl.textContent = 'None yet';
+        modeListEl.textContent = mode === 'mode' ? 'No data yet' : '–';
+        saveButton.disabled = true;
+        return;
+      }
+      numbersListEl.textContent = allNumbers.join(', ');
+      if (mode === 'median') {
+        const median = calculateMedian(allNumbers);
+        mainResultEl.textContent = median !== null ? median : '–';
+        modeListEl.textContent = '–';
+      } else {
+        const modes = calculateModes(allNumbers);
+        if (!modes.length) {
+          mainResultEl.textContent = 'No clear mode';
+          modeListEl.textContent = 'All numbers have similar frequency';
+        } else {
+          mainResultEl.textContent = modes[0];
+          modeListEl.innerHTML = modes.map(m => `<span class="pill">${m}</span>`).join(' ');
+        }
+      }
+      saveButton.disabled = false;
+    }
+
+    async function initCamera() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment' },
+          audio: false
+        });
+        video.srcObject = stream;
+        statusEl.textContent = 'Camera running. Drag/resize the red box to choose the area.';
+        video.onloadedmetadata = () => {
+          resetOverlay();
+        };
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Error accessing camera: ' + err.message;
+      }
+    }
+
+    async function initOCR() {
+      try {
+        statusEl.textContent = 'Loading OCR engine…';
+        ocrWorker = await Tesseract.createWorker('eng');
+        await ocrWorker.setParameters({
+          tessedit_char_whitelist: '0123456789.,'
+        });
+        statusEl.textContent = 'OCR ready. Detecting inside red box…';
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Error loading OCR engine: ' + err.message;
+      }
+    }
+
+    function captureOverlayRegion() {
+      const videoRect = video.getBoundingClientRect();
+      const overlayRect = overlay.getBoundingClientRect();
+
+      const vw = video.videoWidth || 640;
+      const vh = video.videoHeight || 480;
+
+      const scaleX = vw / videoRect.width;
+      const scaleY = vh / videoRect.height;
+
+      const sx = (overlayRect.left - videoRect.left) * scaleX;
+      const sy = (overlayRect.top - videoRect.top) * scaleY;
+      const sw = overlayRect.width * scaleX;
+      const sh = overlayRect.height * scaleY;
+
+      if (sw <= 0 || sh <= 0) return null;
+
+      canvas.width = sw;
+      canvas.height = sh;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+      return canvas.toDataURL('image/png');
+    }
+
+    function extractNumbersFromText(text) {
+      if (!text) return [];
+      const normalized = text.replace(/,/g, '.');
+      const matches = normalized.match(/-?\d*\.?\d+/g);
+      if (!matches) return [];
+      return matches
+        .map(v => Number(v))
+        .filter(v => !Number.isNaN(v));
+    }
+
+    async function analyzeLoop() {
+      if (!ocrWorker || video.readyState < 2) {
+        requestAnimationFrame(analyzeLoop);
+        return;
+      }
+      if (!processing) {
+        processing = true;
+        try {
+          const dataUrl = captureOverlayRegion();
+          if (dataUrl) {
+            const result = await ocrWorker.recognize(dataUrl);
+            const text = result.data && result.data.text ? result.data.text : '';
+            const nums = extractNumbersFromText(text);
+            lastDetectedInFrame = nums;
+            const now = new Date();
+            if (nums.length) {
+              allNumbers.push(...nums);
+              lastUpdateEl.textContent =
+                `${now.toLocaleTimeString()} • Detected in box: ${nums.join(', ')}`;
+              updateStatsDisplay();
+            } else {
+              lastUpdateEl.textContent =
+                `${now.toLocaleTimeString()} • No numbers detected in box`;
+            }
+          }
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = 'Error during OCR: ' + err.message;
+        } finally {
+          processing = false;
+        }
+      }
+      requestAnimationFrame(analyzeLoop);
+    }
+
+    function downloadText(filename, text) {
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+
+    function buildSnapshotText() {
+      const now = new Date();
+      const snapshotTime = now.toISOString();
+      const currentModeLabel = mode === 'median' ? 'Median' : 'Most repeated';
+      const mainResult = mainResultEl.textContent;
+      const allNums = allNumbers.join(', ');
+      const lastFrameNums = lastDetectedInFrame.join(', ');
+      return [
+        `Snapshot time: ${snapshotTime}`,
+        `Mode: ${currentModeLabel}`,
+        `Current result: ${mainResult}`,
+        `All detected numbers: ${allNums || 'None'}`,
+        `Numbers in last frame: ${lastFrameNums || 'None'}`,
+        `Last update label: ${lastUpdateEl.textContent}`
+      ].join('\n');
+    }
+
+    saveButton.addEventListener('click', () => {
+      if (!allNumbers.length) return;
+      const text = buildSnapshotText();
+      const now = new Date();
+      const filename = `numbers_snapshot_${now.toISOString().replace(/[:.]/g,'-')}.txt`;
+      downloadText(filename, text);
+    });
+
+    let dragging = false;
+    let resizing = false;
+    let startX = 0, startY = 0;
+    let startLeft = 0, startTop = 0, startWidth = 0, startHeight = 0;
+
+    function pointerDown(e, type) {
+      e.preventDefault();
+      const rect = overlay.getBoundingClientRect();
+      dragging = (type === 'move');
+      resizing = (type === 'resize');
+      startX = (e.touches ? e.touches[0].clientX : e.clientX);
+      startY = (e.touches ? e.touches[0].clientY : e.clientY);
+      startLeft = rect.left;
+      startTop = rect.top;
+      startWidth = rect.width;
+      startHeight = rect.height;
+    }
+
+    function pointerMove(e) {
+      if (!dragging && !resizing) return;
+      e.preventDefault();
+      const currentX = (e.touches ? e.touches[0].clientX : e.clientX);
+      const currentY = (e.touches ? e.touches[0].clientY : e.clientY);
+      const dx = currentX - startX;
+      const dy = currentY - startY;
+
+      const videoRect = video.getBoundingClientRect();
+      let newLeft = startLeft;
+      let newTop = startTop;
+      let newWidth = startWidth;
+      let newHeight = startHeight;
+
+      if (dragging) {
+        newLeft = startLeft + dx;
+        newTop = startTop + dy;
+      } else if (resizing) {
+        newWidth = Math.max(20, startWidth + dx);
+        newHeight = Math.max(20, startHeight + dy);
+      }
+
+      if (dragging) {
+        if (newLeft < videoRect.left) newLeft = videoRect.left;
+        if (newTop < videoRect.top) newTop = videoRect.top;
+        if (newLeft + startWidth > videoRect.right) newLeft = videoRect.right - startWidth;
+        if (newTop + startHeight > videoRect.bottom) newTop = videoRect.bottom - startHeight;
+      } else if (resizing) {
+        if (startLeft + newWidth > videoRect.right) newWidth = videoRect.right - startLeft;
+        if (startTop + newHeight > videoRect.bottom) newHeight = videoRect.bottom - startTop;
+      }
+
+      const wrapperRect = videoWrapper.getBoundingClientRect();
+      overlay.style.left = (newLeft - wrapperRect.left) + 'px';
+      overlay.style.top = (newTop - wrapperRect.top) + 'px';
+      overlay.style.width = newWidth + 'px';
+      overlay.style.height = newHeight + 'px';
+    }
+
+    function pointerUp() {
+      dragging = false;
+      resizing = false;
+    }
+
+    overlay.addEventListener('mousedown', e => pointerDown(e, 'move'));
+    overlayHandle.addEventListener('mousedown', e => pointerDown(e, 'resize'));
+    window.addEventListener('mousemove', pointerMove);
+    window.addEventListener('mouseup', pointerUp);
+
+    overlay.addEventListener('touchstart', e => pointerDown(e, 'move'), { passive:false });
+    overlayHandle.addEventListener('touchstart', e => pointerDown(e, 'resize'), { passive:false });
+    window.addEventListener('touchmove', pointerMove, { passive:false });
+    window.addEventListener('touchend', pointerUp);
+    window.addEventListener('touchcancel', pointerUp);
+
+    async function start() {
+      await initCamera();
+      await initOCR();
+      analyzeLoop();
+    }
+
+    start();
+  </script>
+</body>
+</html>
